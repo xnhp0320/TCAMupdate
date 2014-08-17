@@ -25,6 +25,7 @@ using namespace std;
 #include "rtrie.h"
 
 FILE *fpr;
+struct pc_rule emptyrule;
 
 void parseargs(int argc, char *argv[]) {
     int	c;
@@ -286,7 +287,15 @@ void Graph_add(tcam & tmap, pc_rule *r, vector<struct node *> &G, int pos)
 
 }
 
-bool lazy_check(tcam &tmap, pc_rule *r, int pos, vector<pc_rule*> &pc, vector<struct node*> &G)
+void update_order(vector<pc_rule*> &pc, int pos, map<int, int> &order)
+{
+    for(size_t i = pos; i < pc.size(); i++) {
+       node *n = pc[i]->n; 
+       order[n->index] = i;
+    }
+}
+
+bool lazy_check(tcam &tmap, pc_rule *r, int pos, int insert_pos, vector<pc_rule*> &pc, vector<struct node*> &G)
 {
     //up node
     struct node * un = NULL;
@@ -330,8 +339,6 @@ bool lazy_check(tcam &tmap, pc_rule *r, int pos, vector<pc_rule*> &pc, vector<st
             //update tcam
             tmap.pc[i] = *r;
             tmap.valid[i] = true;
-            //update pc
-            pc.insert(pc.begin() + pos, r);
             //update graph
             G[i] = r->n;
             G[i]->r = pc[pos];
@@ -345,20 +352,17 @@ bool lazy_check(tcam &tmap, pc_rule *r, int pos, vector<pc_rule*> &pc, vector<st
 }
 
 
-void tcam_insert(tcam & tmap, vector<struct node*> &G, pc_rule *r, int pos, vector<pc_rule*> &pc) 
+
+
+void tcam_insert(tcam & tmap, vector<struct node*> &G, pc_rule *r, int pos, vector<pc_rule*> &pc)
 {
     struct node *sn = NULL;
     struct node *wn = r->n;
     pc_rule sr; 
     pc_rule wr = *r;
 
-    int insert_pos = -1;
-    for(size_t i = pos; i< pc.size(); i++) {
-        if(overlap(pc[i], r)) {
-            insert_pos = pc[i]->n->index;
-            break;
-        }
-    }
+    int insert_pos = pos;
+
     int first_pos = insert_pos;
 
     while(insert_pos != -1) {
@@ -402,19 +406,195 @@ void tcam_insert(tcam & tmap, vector<struct node*> &G, pc_rule *r, int pos, vect
 }
 
 
-void add_rule(tcam & tmap, vector<struct node*> &G, pc_rule *r, int pos, vector<pc_rule*> &pc)
+void down_rule(tcam &tmap, int up_pos, vector<struct node *>&G, int count)
+{
+    if(G[up_pos]->out.size() == 0) {
+        //leaf node
+        //reserve *count* entries empty space
+        for(int i = 0; i < count; i++) {
+            G.push_back((node*)nullptr);
+            tmap.pc.push_back(emptyrule);
+        }
+        G[G.size() -1] = G[up_pos];
+        G[G.size()-1]->index = G.size() - 1; 
+        tmap.pc[tmap.pc.size()-1] = *(G[G.size()-1]->r);
+        return;
+    }
+
+    down_rule(tmap, G[up_pos]->out[0]->index, G, count);
+    
+    /* pop stack, each time, we need to move forward
+     * *count* stride, be careful when the *out* branches 
+     * run out.
+     */
+
+    int curr_pos = up_pos;
+    int i;
+    for(i = 0; i <count; i++) {
+        if(G[curr_pos]->out.size() > 0) {
+            curr_pos = G[curr_pos]->out[0]->index;
+        }
+        else {
+            G[G.size()-count-1] = G[up_pos];
+            G[G.size()-count-1]->index  = G.size() - count -1;
+            tmap.pc[tmap.pc.size()-count-1] = *(G[G.size()-count-1]->r);
+            break;
+        }
+    }
+
+    if(i== count) {
+        G[curr_pos] = G[up_pos];
+        G[curr_pos]->index = curr_pos;
+        tmap.pc[curr_pos] = *(G[curr_pos]->r);
+    }
+}
+
+void adjust_up(tcam &tmap, int up_pos, vector<struct node*> &G, int insert_pos, map<int, int> &order)
+{
+    /* adjust up is different from ajust down
+     * when adjust upper rules, you can image you are actually insert 
+     * an empty rules at the up_pos, and push the actual rules into 
+     * the lower places
+     */
+
+
+    /* how many empty rules we need to insert?
+     */
+    node *tmp = G[up_pos];
+    int count = 0;
+    while(tmp->index < insert_pos) {
+        count ++;
+
+        order.erase(tmp->index);
+        G[tmp->index]->valid = false;
+        tmap.pc[tmp->index] = emptyrule;
+        tmap.valid[tmp->index] = false;
+
+        if(tmp->out.size() > 0)
+            tmp = tmp->out[0];
+        else
+            break;
+    }
+
+    /* let us do a *count* stride movement
+     * we implement this recursively, check
+     * this out.
+     */
+
+    down_rule(tmap, up_pos, G, count);
+}
+
+void adjust_down(tcam & tmap, int far_pos, vector<struct node *> &G, int insert_pos, map<int, int> &order)
+{
+    /* we need to push down the rule at insert_pos, 
+     * similarly, how many empty rules we need to insert?
+     */
+
+    node *tmp = G[insert_pos];
+    int count = 0;
+    while(tmp->index < far_pos) {
+        count ++;
+
+        order.erase(tmp->index);
+        G[tmp->index]->valid = false;
+        tmap.pc[tmp->index]= emptyrule; 
+        tmap.valid[tmp->index] = false;
+
+        if(tmp->out.size() > 0)
+            tmp = tmp->out[0];
+        else
+            break;
+    }
+
+    down_rule(tmap, insert_pos, G, count);
+
+}
+
+void adjust(tcam &tmap, vector<pc_rule*> &pc, int pos, pc_rule *r, vector<struct node *> &G, map<int, int> &order, int *insert_pos)
+{
+    /* need ajust?
+     * if the inserted rule overlaped with two independent chains, 
+     * and also the relative order of the rules in two chains on TCAM
+     * is inconsistent with the inserte rule, we need first adjust the 
+     * the order of rules on TCAM, before we insert. 
+     */ 
+    
+    /* first we find the insert pos as usual
+     */
+    int pc_insert_pos = -1;
+    for(size_t i = pos; i< pc.size(); i++) {
+        if(overlap(pc[i], r)) {
+            pc_insert_pos = pc[i]->n->index;
+            break;
+        }
+    }
+
+    /* there are no rules overlapped with this rule, 
+     * Great news, we insert the rule at the end of the TCAM
+     */
+    if(pc_insert_pos == -1) {
+        *insert_pos = -1;
+        return;
+    }
+
+    /* Is there any rules stay above the rules in insert_pos
+     * however has actually larger priority, and also 
+     * overlap with the inserted rule? 
+     *
+     * if there is, we need upper ajust to move these 
+     * rules stay below the rule at insert_pos first 
+     */
+    for (size_t i = 0; i < (size_t)G[pc_insert_pos]->index; i++) {
+        if(G[i]->valid && overlap(G[i]->r, r)) {
+            if(order[i] > order[pc_insert_pos]) {
+                adjust_up(tmap, i, G, pc_insert_pos, order);
+            }
+        }
+    }
+
+    /* Again, we need also a ajust_down
+     * adjust_down is quite different, 
+     * actually, we need to move the rule 
+     * at insert_pos down, but how far we need to move?
+     */
+
+    int far = 0;
+    for (size_t i = G[pc_insert_pos]->index +1; i < G.size(); i++) {
+        if(G[i]->valid && overlap(G[i]->r, r)) {
+            if(order[i] < order[pc_insert_pos]) {
+                far = i;
+            }
+        }
+    }
+
+    if(far!= 0){
+        adjust_down(tmap, far, G, pc_insert_pos, order);
+        *insert_pos = pc[pc_insert_pos]->n->index;
+    }
+
+
+}
+
+void add_rule(tcam & tmap, vector<struct node*> &G, pc_rule *r, int pos, vector<pc_rule*> &pc, map<int, int> &order)
 {
     //first add the node in the tcam, perform movement
     //then update the graph.
     
     r->n = new node();
     //first lazy check
+    int insert_pos = -1;
+    adjust(tmap, pc, pos, r, G, order, &insert_pos); 
     
-    if(!lazy_check(tmap, r, pos, pc, G)) {
-        tcam_insert(tmap, G, r, pos, pc); 
+    if(!lazy_check(tmap, r, pos, insert_pos, pc, G)) {
+        tcam_insert(tmap, G, r, insert_pos, pc); 
     }
 
     pc.insert(pc.begin() + pos, r);
+
+    //to maintain the order consistency, 
+    //we have no chioce but a O(N) scan of pc, this is tough
+    //for large rulesets.
+    update_order(pc, pos, order);
     r->n->r = pc[pos];
 }
 
@@ -726,6 +906,8 @@ void pure_arch(vector<pc_rule*> &in)
 {
     cout<<endl<<"Pure Arch"<<endl;
     vector<struct node *> G2;
+
+    map<int, int> order;
     build_graph(in, G2);
 
 
